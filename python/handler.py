@@ -83,7 +83,7 @@ class File(object):
             f.write(buffer)
 
     @timing
-    def read(self, userid, uuid, out):
+    def read(self, userid, uuid, out, *args, **kwargs):
         path = os.path.join(userid, uuid)
         buffer = ''
         with open(path, 'rb') as f:
@@ -103,7 +103,7 @@ class Swift(object):
         pass
 
     @timing
-    def read(self, userid, uuid, out):
+    def read(self, userid, uuid, out, *args, **kwargs):
         pass
 
 def main():
