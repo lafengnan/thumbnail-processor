@@ -92,6 +92,20 @@ class File(object):
         with open(out, 'wb') as o:
             o.write(buffer)
 
+class Swift(object):
+    """
+    Swift
+    Swift represents the interface to work with OpenStack/Swift cluster
+    """
+
+    @timing
+    def write(self, userid, uuid, buffer, *args, **kwargs):
+        pass
+
+    @timing
+    def read(self, userid, uuid, out):
+        pass
+
 def main():
     parser = OptionParser(USAGE)
     parser.add_option('-f', '--file', type='string', dest='thumbnail',
