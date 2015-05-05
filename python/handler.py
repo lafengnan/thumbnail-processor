@@ -3,6 +3,7 @@
 import sys
 import os
 import time
+from functools import wraps
 import redis
 from uuid import uuid4
 from optparse import OptionParser
@@ -21,7 +22,7 @@ Commands:
 def info(logger, msg):
     logger.info(msg)
 
-def setup_logger(log=False, level=logging.INFO):
+def setup_logger(log=True, level=logging.INFO):
     FORMAT = '[%(asctime)-15s] %(message)s'
     logger = logging.getLogger(__name__)
     logger.setLevel(level)
@@ -35,19 +36,26 @@ def setup_logger(log=False, level=logging.INFO):
 
     return logger
 
+logger = setup_logger()
+
 def get_connection_pool(host=REDIS, port=6379, db=0):
     pool = redis.ConnectionPool(host=host, port=port, db=db)
     return pool
 
-def timing(f, *args, **kwargs):
-    def deco(*args, **kwargs):
-        b = time.time()
-        r = f(*args, **kwargs)
-        e = time.time()
-        print("spending {} seconds".format(e-b))
-        return r
+def timing(logger):
+    def deco(f, *args, **kwargs):
+        @wraps(f)
+        def real_deco(*args, **kwargs):
+            b = time.time()
+            r = f(*args, **kwargs)
+            e = time.time()
+            logger.info("function:{} spending {} seconds"\
+                        .format(f.__name__, e - b))
+            return r
+        return real_deco
     return deco
 
+@timing(logger)
 def get_file_content(path):
     assert os.path.exists(path)
     content = ''
@@ -55,7 +63,6 @@ def get_file_content(path):
         for l in f:
             content += l
     return content
-
 
 def travel_dir(path):
     """
@@ -65,35 +72,59 @@ def travel_dir(path):
     path, _, fs = os.walk(path).next()
     return [os.path.join(os.path.abspath(path), f) for f in fs]
 
+class PolarisStage(object):
+    """
+    PolarisStage
+    PolarisStage defines the abstract interface for staging thumbnails to tmp
+    storage. Currently the original thumbnails are uploaded to swift, the
+    performance is not good. Ideally the thumbnails could be staged in storage
+    on demand of local file system, memcached(redis) and redis.
+    """
+    def __init__(self, *args, **kwargs):
+        super(PolarisStage, self).__init__()
+        self.logger = logger
+        self.logger.info("Using {} to store thumbnails".format(self.__class__.__name__))
 
-class PolarisRedis(redis.StrictRedis):
+    @timing(logger)
+    def write(self, userid, uuid, content, *args, **kwargs):
+        return self._write(userid, uuid, content, *args, **kwargs)
+
+    @timing(logger)
+    def read(self, userid, uuid, out=None, *args, **kwargs):
+        return self._read(userid, uuid, out=None, *args, **kwargs)
+
+class PolarisRedis(PolarisStage, redis.Redis):
     """
     Redis
     Redis represents the connection to redis cluster
     """
-    def __init__(self, logger, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super(PolarisRedis, self).__init__(*args, **kwargs)
-        self.logger = logger or setup_logger()
-        self.logger.info("Using {} to store thumbnails".format(self.__class__))
 
-    @timing
-    def write(self, userid, uuid, content, *args, **kwargs):
+    def _write(self, userid, uuid, content, *args, **kwargs):
         """
         write interface will write thumbnails to redis for cache
         the file will be writen into redis as blob string:
         userid:uuid thumbnail
         """
         k = userid + ":" + uuid
-        self.setex(k, 60, content)
+        ttl = kwargs.get('ttl', None)
+        if ttl:
+            self.setex(k, content, ttl)
+            #self.setex(k, 60, content) # for redis.StrictRedis
+        else:
+            self.set(k, content)
+
         return k
 
-    @timing
-    def read(self, userid, uuid, out=None, *args, **kwargs):
+    def _read(self, userid, uuid, out=None, *args, **kwargs):
         """
         read interface will read thumbnails from reids cache
         """
         k = userid + ":" + uuid
         content = self.get(k)
+        if not content:
+            raise ValueError("No Content")
         target_dir = os.path.join(kwargs.get('prefix', '/tmp'), userid)
         if not os.path.exists(target_dir):
             os.mkdir(target_dir)
@@ -102,18 +133,12 @@ class PolarisRedis(redis.StrictRedis):
         with open(target_path, 'wb') as f:
             f.write(content)
 
-class PolarisFile(object):
+class PolarisFile(PolarisStage):
     """
     File
     File represents the local file system write/read operations
     """
-    def __init__(self, logger, *args, **kwargs):
-        super(PolarisFile, self).__init__()
-        self.logger = logger or setup_logger()
-        self.logger.info("Using {} to store thumbnails".format(self.__class__))
-
-    @timing
-    def write(self, userid, uuid, content, *args, **kwargs):
+    def _write(self, userid, uuid, content, *args, **kwargs):
         target_dir = os.path.join(kwargs.get('prefix', '/tmp'), userid)
         if not os.path.exists(target_dir):
             os.mkdir(target_dir)
@@ -123,8 +148,7 @@ class PolarisFile(object):
 
         return userid + ":" + uuid
 
-    @timing
-    def read(self, userid, uuid, out=None, *args, **kwargs):
+    def _read(self, userid, uuid, out=None, *args, **kwargs):
         source_dir = kwargs.get('source_dir')
         target_dir = os.path.join(kwargs.get('prefix', '/tmp'), userid)
         if not os.path.exists(target_dir):
@@ -152,25 +176,29 @@ class Swift(object):
     Swift represents the interface to work with OpenStack/Swift cluster
     """
 
-    @timing
+    @timing(logger)
     def write(self, userid, uuid, buffer, *args, **kwargs):
         pass
 
-    @timing
+    @timing(logger)
     def read(self, userid, uuid, out, *args, **kwargs):
         pass
 
+@timing(logger)
 def upload(handler, source_path, target_dir=None, redis=True, **kwargs):
     logger = kwargs.get('logger')
-    info(logger, "uploading {}...".format(source_path))
+    info(logger, "uploading {} to {}. redis:{}, args:{}..."\
+         .format(source_path, target_dir, redis, kwargs))
     assert os.path.exists(source_path)
 
     userid = kwargs.get('userid')
     uuid = uuid4().hex
+    ttl = kwargs.get('ttl', None)
     content = get_file_content(source_path)
-    k = handler.write(userid, uuid, content, prefix=target_dir)
+    k = handler.write(userid, uuid, content, prefix=target_dir, ttl=ttl)
     return k
 
+@timing(logger)
 def download(handler, source_dir, target_dir, **kwargs):
     logger = kwargs.get('logger')
     info(logger, "downloading from {} to {}".format(source_dir, target_dir))
@@ -194,12 +222,14 @@ def main():
     parser = OptionParser(USAGE)
     parser.add_option('-b', '--batch', action='store_true', dest='batch',
                       default=False, help='batch upload files')
+    parser.add_option('-d', '--database', type='int', dest='db',
+                      default=0, help='expired after expire seconds')
+    parser.add_option('-e', '--expire', type='int', dest='expire',
+                      default=-1, help='expired after expire seconds')
     parser.add_option('-f', '--file', type='string', dest='file',
                       help='the file to upload')
     parser.add_option('-i', '--uuid', type='string', dest='uuid',
                       help='the uuid of a file')
-    parser.add_option('-l', '--log', action='store_true', dest='log',
-                      default=False, help='log all info in log file')
     parser.add_option('-o', '--outfile', type='string', dest='outfile',
                       help='the generated file')
     parser.add_option('-p', '--prefix', type='string', dest='prefix',
@@ -214,7 +244,6 @@ def main():
                       help='the user id')
 
     options, args = parser.parse_args()
-    logger = setup_logger(options.log)
     if len(args) != 1:
         parser.print_help()
         info(logger, "Error: config the command")
@@ -226,22 +255,37 @@ def main():
         info(logger, "Error: Unkown command: {}".format(cmd))
         return 1
 
-
     userid = options.userid or 'testing'
     prefix = options.prefix or "/tmp"
 
-    pool = get_connection_pool(host=REDIS, port=6379)
+    pool = get_connection_pool(host=REDIS, port=6379, db=options.db)
     h = PolarisRedis(logger, connection_pool=pool) if options.redis \
     else PolarisFile(logger)
 
     if cmd == 'upload':
-        file = options.file
         batch = options.batch
+        prefix = "db"+str(options.db) if options.redis else prefix
         if batch:
             fs = travel_dir(options.source_dir)
             for file in fs:
-                k = upload(h, file, userid=userid, target_dir=prefix, logger=logger)
+                k = upload(h, 
+                           file, 
+                           userid=userid, 
+                           target_dir=prefix,
+                           logger=logger, 
+                           ttl=options.expire)
+
                 info(logger, "Key:{}".format(k))
+        else:
+            file = options.file
+            k = upload(h,
+                       file,
+                       userid=userid,
+                       target_dir=prefix,
+                       logger=logger,
+                      ttl=options.expire)
+            info(logger, "Key:{}".format(k))
+
     elif cmd == 'download':
         assert options.uuid != ""
         source_dir = options.source_dir if not options.redis else "Redis"
