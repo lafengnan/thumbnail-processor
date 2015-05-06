@@ -20,10 +20,13 @@ func newPool(server, password string) *redis.Pool {
                 log.Println(err)
                 return nil, err
             }
-            if _, err :=  c.Do("AUTH", password); err != nil {
-                c.Close()
-                log.Println(err)
-                return nil, err
+
+            if len(password) > 0 {
+                if _, err :=  c.Do("AUTH", password); err != nil {
+                    c.Close()
+                    log.Println(err)
+                    return nil, err
+                }
             }
             return c, err
         },
@@ -38,20 +41,62 @@ func newPool(server, password string) *redis.Pool {
 var (
     pool *redis.Pool
     server = flag.String("server", ":6379", "")
-    password = flag.String("password", "123", "")
+    password = flag.String("password", "", "")
+    thumbnail = flag.String("file", "", "")
+    key = flag.String("key", "key", "")
+    userid = flag.String("userid", "anan", "")
+    uuid = flag.String("uuid", "123", "")
+    out = flag.String("outfile", "test", "")
 )
+
+func download(conn redis.Conn, userid, uuid, out string) (n int, err error) {
+    k := userid + ":" + uuid
+    b := time.Now()
+    content, err := conn.Do("GET", k)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if content == nil {
+        log.Printf("Empty key: %v", k)
+        syscall.Exit(1)
+    }
+    f, err := os.Create(out)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer f.Close()
+
+    n, err = f.Write(content.([]byte))
+    if err != nil {
+        log.Fatal(err)
+    }
+    e := time.Now()
+    log.Printf("Spends %v seconds to download %s from redis", e.Sub(b), k)
+    if n != len(content.([]byte)) {
+        log.Fatal("partial write!")
+    }
+
+    return
+}
 
 func main() {
 
     flag.Parse()
     pool = newPool(*server, *password)
-    daemon(0, 1)
     conn := pool.Get()
+    defer conn.Close()
+    n, err := download(conn, *userid, *uuid, *out)
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("Download competed! %v bytes was downloaded", n)
+    //daemon(0, 1)
+    /*
     for {
         log.Println(syscall.Getpid(), "Starting...")
         time.Sleep(1 * time.Second)
     }
-    defer conn.Close()
+    */
 }
 
 func daemon(nochdir, noclose int) int {
