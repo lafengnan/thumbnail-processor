@@ -1,0 +1,30 @@
+client:Actor
+server:Storage[a]
+stage:Stage[a]
+redis:Redis[a]
+swift:Swift[a]
+celery:Celery[a]
+cassandra:Cassandra[a]
+es:Elasticsearch[a]
+
+client:server.PUT(thumbnail)
+server:stage._stage_thumbnail(thumbnail)
+[c:condition redis down?]
+   stage:swift.PUT(thumbnail)
+ --else
+   stage:redis.LPUSH(userid:uuid, thumbnail)
+[/c:condition]
+server:client.return 200, OK
+server:>celery.apply_async(resize)
+celery:thumbnail=redis.RPOPLPUSH(userid:uuid, stage_queue, process_queue)
+[c:condition redis down or return empty?]
+celery:thumbnail=swift.GET(userid:uuid)
+[/c:condition]
+celery:server.resize(thumnail)
+celery:swift.PUT(resized thumbnail)
+celery:cassandra.update_cf()
+celery:es.update_metadata()
+celery:redis.RPOP(userid:uuid, process_queue)
+[c:condition not in redis?]
+celery:swift.Delete(thumbnail)
+[/c:condition]
