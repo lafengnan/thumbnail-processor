@@ -59,8 +59,6 @@ func main() {
 	defer conn.Close()
 	ppool := pool.NewPool(10)
 	ppool.Run()
-	ppool.AddJob(download, "1", "2", "3")
-
 	/*
 		n, err := download(conn, *userid, *uuid, *out)
 		if err != nil {
