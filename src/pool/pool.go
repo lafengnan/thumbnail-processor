@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+// Constants of a job status
+const (
+	Born = iota
+	Submitted
+	Running
+	Succeed
+	Failed
+	Ghost
+)
+
+var stats = map[int]string{
+	Born:      "Born",
+	Submitted: "Submmited",
+	Running:   "Running",
+	Succeed:   "Succeed",
+	Failed:    "Failed",
+	Ghost:     "Ghost",
+}
+
 type Job struct {
 	Id     uuid.UUID
 	Stat   int
@@ -23,37 +42,47 @@ type Job struct {
 
 func (job *Job) Info() {
 	fname := reflect.ValueOf(job.F)
-	log.Printf("Job Id: %s, Stat: %d task: %s(%s)", job.Id.String(), job.Stat, fname)
+	log.Printf("Job Id: %s, Stat: %v, task: %s(%v)", job.Id.String(), stats[job.Stat], fname, job.Args)
 }
 
-// Constants of a job status
-const (
-	Born = iota
-	Submitted
-	Running
-	Succeed
-	Failed
-	Ghost
-)
-
 type Pool struct {
-	supervisor_started bool
-	workers_started    bool
-	num_workers        int
-	num_jobs_born      int
-	num_jobs_submitted int
-	num_jobs_running   int
-	num_jobs_succeed   int
-	num_jobs_failed    int
-	num_jobs_ghost     int
-	jobs_inqueue       chan *Job
-	jobs_outqueue      chan *Job
-	jobs_ready_to_run  *list.List
-	jobs_succeed       *list.List
-	jobs_failed        *list.List
-	interval           time.Duration
-	worker_wg          sync.WaitGroup
-	supervisor_wg      sync.WaitGroup
+	muLock                 *sync.Mutex
+	supervisor_started     bool
+	workers_started        bool
+	num_workers            int
+	num_running_workers    int
+	num_jobs_born          int
+	num_jobs_submitted     int
+	num_jobs_running       int
+	num_jobs_succeed       int
+	num_jobs_failed        int
+	num_jobs_ghost         int
+	jobs_in                chan *Job
+	jobs_out               chan *Job
+	job_to_worker_chan     chan chan *Job
+	jobs_ready_to_run      *list.List
+	jobs_succeed           *list.List
+	jobs_failed            *list.List
+	supervisor_killed_chan chan bool
+	worker_killed_chan     chan bool
+	interval               time.Duration
+	worker_wg              sync.WaitGroup
+	supervisor_wg          sync.WaitGroup
+}
+
+func NewPool(workers int) (pool *Pool) {
+	pool = new(Pool)
+	pool.muLock = new(sync.Mutex)
+	pool.num_workers = workers
+	pool.jobs_ready_to_run = list.New()
+	pool.jobs_succeed = list.New()
+	pool.jobs_failed = list.New()
+	pool.jobs_in = make(chan *Job)
+	pool.jobs_out = make(chan *Job)
+	pool.job_to_worker_chan = make(chan chan *Job)
+	pool.interval = 1
+
+	return
 }
 
 func (pool *Pool) AddJob(f func(...interface{}) (interface{}, error), args ...interface{}) {
@@ -66,9 +95,11 @@ func (pool *Pool) AddJob(f func(...interface{}) (interface{}, error), args ...in
 	job.Err = nil
 	job.added = make(chan bool)
 
-	pool.jobs_inqueue <- job
+	pool.muLock.Lock()
+	pool.num_jobs_born++
+	pool.muLock.Unlock()
+	pool.jobs_in <- job
 	<-job.added
-	job.Info()
 }
 
 // Start a supervisor
@@ -79,43 +110,45 @@ func (pool *Pool) startSupervisor() {
 	log.Println("Starting supervisor...")
 	pool.supervisor_wg.Add(1)
 	go pool.supervisor()
-	pool.supervisor_wg.Wait()
 	pool.supervisor_started = true
 
 }
 
+// Stop a supervisor
+func (pool *Pool) stopSupervisor() {
+	if !pool.supervisor_started {
+		panic("Stop a stale supervisor")
+	}
+	pool.supervisor_killed_chan <- true
+	pool.supervisor_wg.Wait()
+	pool.supervisor_started = false
+}
+
 // supervisor manage and monitor all jobs
 func (pool *Pool) supervisor() {
-	pool.supervisor_wg.Done()
-}
-
-// Start a worker
-func (pool *Pool) startWorker(idx int) {
-	log.Printf("Starting worker %d ...", idx)
-	pool.worker_wg.Done()
-
-}
-
-// Run pool
-func (pool *Pool) Run() {
-	pool.startSupervisor()
-	for i := 0; i < pool.num_workers; i++ {
-		pool.worker_wg.Add(1)
-		go pool.startWorker(i)
+SUPER_LOOP:
+	for {
+		select {
+		// New job
+		case job := <-pool.jobs_in:
+			pool.jobs_ready_to_run.PushBack(job)
+			pool.num_jobs_submitted++
+			job.added <- true
+		// Send job to worker
+		case job_out := <-pool.job_to_worker_chan:
+			e := pool.jobs_ready_to_run.Front()
+			var job *Job = nil
+			if e != nil {
+				job = e.Value.(*Job)
+				pool.num_jobs_running++
+				pool.jobs_ready_to_run.Remove(e)
+			}
+			job_out <- job
+		case <-pool.supervisor_killed_chan:
+			break SUPER_LOOP
+		}
 	}
-	pool.worker_wg.Wait()
-	pool.workers_started = true
-}
-
-func NewPool(workers int) (pool *Pool) {
-	pool = new(Pool)
-	pool.num_workers = workers
-	pool.jobs_ready_to_run = list.New()
-	pool.jobs_succeed = list.New()
-	pool.jobs_failed = list.New()
-	pool.interval = 1
-
-	return
+	pool.supervisor_wg.Done()
 }
 
 func working(job *Job) (err error) {
@@ -129,6 +162,64 @@ func working(job *Job) (err error) {
 
 	job.Result, err = job.F(job.Args...)
 	return
+}
+
+// Start a worker
+func (pool *Pool) startWorker(idx int) {
+	log.Printf("Starting worker %d ...", idx)
+	pool.muLock.Lock()
+	pool.num_running_workers++
+	pool.muLock.Unlock()
+	job_out := make(chan *Job)
+WORKER_LOOP:
+	for {
+		pool.job_to_worker_chan <- job_out
+		job := <-job_out
+		if job == nil {
+			time.Sleep(pool.interval * time.Millisecond)
+		} else {
+			working(job)
+			pool.jobs_out <- job
+		}
+		select {
+		case <-pool.worker_killed_chan:
+			break WORKER_LOOP
+		default:
+		}
+	}
+	pool.worker_wg.Done()
+}
+
+// Run pool
+func (pool *Pool) Run() {
+	pool.startSupervisor()
+	for i := 0; i < pool.num_workers; i++ {
+		pool.worker_wg.Add(1)
+		go pool.startWorker(i)
+	}
+	for {
+		if pool.num_running_workers == pool.num_workers {
+			break
+		}
+		time.Sleep(pool.interval * time.Millisecond)
+	}
+	pool.workers_started = true
+	log.Printf("%d workers are running successfully!", pool.num_running_workers)
+}
+
+// Stop pool
+func (pool *Pool) Stop() {
+	if !pool.workers_started {
+		panic("The pool has stopped!")
+	}
+	for i := 0; i < pool.num_workers; i++ {
+		pool.worker_killed_chan <- true
+	}
+	pool.worker_wg.Wait()
+	pool.workers_started = false
+	if pool.supervisor_started {
+		pool.stopSupervisor()
+	}
 }
 
 func NewRedisPool(server, password string) *redis.Pool {

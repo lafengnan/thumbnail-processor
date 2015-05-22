@@ -12,13 +12,14 @@ import (
 )
 
 var (
-	server    = flag.String("server", ":6379", "")
-	password  = flag.String("password", "", "")
-	thumbnail = flag.String("file", "", "")
-	key       = flag.String("key", "key", "")
-	userid    = flag.String("userid", "anan", "")
-	uuid      = flag.String("uuid", "123", "")
-	out       = flag.String("outfile", "test", "")
+	server      = flag.String("server", ":6379", "")
+	password    = flag.String("password", "", "")
+	thumbnail   = flag.String("file", "", "")
+	key         = flag.String("key", "key", "")
+	userid      = flag.String("userid", "anan", "")
+	uuid        = flag.String("uuid", "123", "")
+	out         = flag.String("outfile", "test", "")
+	concurrency = flag.Int("concurrency", 10, "")
 )
 
 func download(conn redis.Conn, userid, uuid, out string) (n int, err error) {
@@ -51,14 +52,27 @@ func download(conn redis.Conn, userid, uuid, out string) (n int, err error) {
 	return
 }
 
+func test(args ...interface{}) (rv interface{}, err error) {
+	log.Println("test...")
+	return
+}
+
 func main() {
 
 	flag.Parse()
 	redis_pool := pool.NewRedisPool(*server, *password)
 	conn := redis_pool.Get()
 	defer conn.Close()
-	ppool := pool.NewPool(10)
+	ppool := pool.NewPool(*concurrency)
 	ppool.Run()
+	ppool.AddJob(test, 1, 2, 3)
+	log.Println("main Looooooooooooooooooooooooooooooooop")
+MAIN_LOOP:
+	for {
+		if 100 < 0 {
+			break MAIN_LOOP
+		}
+	}
 	/*
 		n, err := download(conn, *userid, *uuid, *out)
 		if err != nil {
