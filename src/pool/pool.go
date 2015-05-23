@@ -40,9 +40,22 @@ type Job struct {
 	added  chan bool
 }
 
+func NewJob(f func(...interface{}) (interface{}, error), args ...interface{}) *Job {
+	job := &Job{
+		Id:     uuid.NewV4(),
+		Stat:   Born,
+		F:      f,
+		Args:   args,
+		Result: nil,
+		Err:    nil,
+		added:  make(chan bool),
+	}
+	return job
+}
+
 func (job *Job) Info() {
 	fname := reflect.ValueOf(job.F)
-	log.Printf("Job Id: %s, Stat: %v, task: %s(%v)", job.Id.String(), stats[job.Stat], fname, job.Args)
+	log.Printf("Job Info: \n\tJob Id: %s\n\tStat: %v\n\ttask: %s(%v)\n", job.Id.String(), stats[job.Stat], fname, job.Args)
 }
 
 type Pool struct {
@@ -57,8 +70,8 @@ type Pool struct {
 	num_jobs_succeed       int
 	num_jobs_failed        int
 	num_jobs_ghost         int
-	jobs_in                chan *Job
-	jobs_out               chan *Job
+	job_in                 chan *Job
+	job_done               chan *Job
 	job_to_worker_chan     chan chan *Job
 	jobs_ready_to_run      *list.List
 	jobs_succeed           *list.List
@@ -77,28 +90,21 @@ func NewPool(workers int) (pool *Pool) {
 	pool.jobs_ready_to_run = list.New()
 	pool.jobs_succeed = list.New()
 	pool.jobs_failed = list.New()
-	pool.jobs_in = make(chan *Job)
-	pool.jobs_out = make(chan *Job)
+	pool.job_in = make(chan *Job)
+	pool.job_done = make(chan *Job)
 	pool.job_to_worker_chan = make(chan chan *Job)
 	pool.interval = 1
 
+	pool.startSupervisor()
 	return
 }
 
 func (pool *Pool) AddJob(f func(...interface{}) (interface{}, error), args ...interface{}) {
-	job := new(Job)
-	job.Id = uuid.NewV4()
-	job.Stat = Born
-	job.F = f
-	job.Args = args
-	job.Result = nil
-	job.Err = nil
-	job.added = make(chan bool)
-
+	job := NewJob(f, args...)
 	pool.muLock.Lock()
 	pool.num_jobs_born++
 	pool.muLock.Unlock()
-	pool.jobs_in <- job
+	pool.job_in <- job
 	<-job.added
 }
 
@@ -130,7 +136,7 @@ SUPER_LOOP:
 	for {
 		select {
 		// New job
-		case job := <-pool.jobs_in:
+		case job := <-pool.job_in:
 			pool.jobs_ready_to_run.PushBack(job)
 			pool.num_jobs_submitted++
 			job.added <- true
@@ -144,6 +150,9 @@ SUPER_LOOP:
 				pool.jobs_ready_to_run.Remove(e)
 			}
 			job_out <- job
+		case job := <-pool.job_done:
+			pool.num_jobs_running--
+			pool.jobs_succeed.PushBack(job)
 		case <-pool.supervisor_killed_chan:
 			break SUPER_LOOP
 		}
@@ -166,7 +175,7 @@ func working(job *Job) (err error) {
 
 // Start a worker
 func (pool *Pool) startWorker(idx int) {
-	log.Printf("Starting worker %d ...", idx)
+	log.Printf("Starting worker %d...", idx)
 	pool.muLock.Lock()
 	pool.num_running_workers++
 	pool.muLock.Unlock()
@@ -178,8 +187,9 @@ WORKER_LOOP:
 		if job == nil {
 			time.Sleep(pool.interval * time.Millisecond)
 		} else {
+			log.Print("In worker ", idx)
 			working(job)
-			pool.jobs_out <- job
+			pool.job_done <- job
 		}
 		select {
 		case <-pool.worker_killed_chan:
@@ -192,11 +202,14 @@ WORKER_LOOP:
 
 // Run pool
 func (pool *Pool) Run() {
-	pool.startSupervisor()
+	if !pool.supervisor_started {
+		pool.startSupervisor()
+	}
 	for i := 0; i < pool.num_workers; i++ {
 		pool.worker_wg.Add(1)
 		go pool.startWorker(i)
 	}
+
 	for {
 		if pool.num_running_workers == pool.num_workers {
 			break
@@ -205,6 +218,7 @@ func (pool *Pool) Run() {
 	}
 	pool.workers_started = true
 	log.Printf("%d workers are running successfully!", pool.num_running_workers)
+
 }
 
 // Stop pool

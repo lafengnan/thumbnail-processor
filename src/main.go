@@ -64,12 +64,14 @@ func main() {
 	conn := redis_pool.Get()
 	defer conn.Close()
 	ppool := pool.NewPool(*concurrency)
-	ppool.Run()
 	ppool.AddJob(test, 1, 2, 3)
-	log.Println("main Looooooooooooooooooooooooooooooooop")
+	ppool.AddJob(test, 1, 2, 3)
+	ppool.AddJob(test, 1, 2, 3)
+	ppool.Run()
+	log.Println("main looooooooooooooooooooooooooooooooop")
 MAIN_LOOP:
 	for {
-		if 100 < 0 {
+		if 1 < 0 {
 			break MAIN_LOOP
 		}
 	}
