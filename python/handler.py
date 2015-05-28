@@ -100,6 +100,8 @@ class PolarisRedis(PolarisStage, redis.Redis):
     """
     def __init__(self, *args, **kwargs):
         super(PolarisRedis, self).__init__(*args, **kwargs)
+        self.ready_queue = "ready_queue"
+        self.working_queue = "working_queue"
 
     def _write(self, userid, uuid, content, *args, **kwargs):
         """
@@ -107,13 +109,15 @@ class PolarisRedis(PolarisStage, redis.Redis):
         the file will be writen into redis as blob string:
         userid:uuid thumbnail
         """
-        k = userid + ":" + uuid
+        k = userid + "_" + uuid
+        logger.info("k len: %s", len(k))
         ttl = kwargs.get('ttl', None)
-        if ttl:
-            self.setex(k, content, ttl)
-            #self.setex(k, 60, content) # for redis.StrictRedis
-        else:
-            self.set(k, content)
+        self.lpush(self.ready_queue, k+content)
+        #if ttl:
+        #    self.setex(k, content, ttl)
+        #    #self.setex(k, 60, content) # for redis.StrictRedis
+        #else:
+        #    self.set(k, content)
 
         return k
 
@@ -121,8 +125,10 @@ class PolarisRedis(PolarisStage, redis.Redis):
         """
         read interface will read thumbnails from reids cache
         """
-        k = userid + ":" + uuid
-        content = self.get(k)
+        k = userid + "_" + uuid
+        content = self.rpoplpush(self.ready_queue, self.working_queue)
+        logger.info(content[0:38])
+
         if not content:
             raise ValueError("No Content")
         target_dir = os.path.join(kwargs.get('prefix', '/tmp'), userid)
@@ -131,7 +137,7 @@ class PolarisRedis(PolarisStage, redis.Redis):
         o_file = out or uuid
         target_path = os.path.join(target_dir, o_file)
         with open(target_path, 'wb') as f:
-            f.write(content)
+            f.write(content[38:])
 
 class PolarisFile(PolarisStage):
     """
@@ -268,11 +274,11 @@ def main():
         if batch:
             fs = travel_dir(options.source_dir)
             for file in fs:
-                k = upload(h, 
-                           file, 
-                           userid=userid, 
+                k = upload(h,
+                           file,
+                           userid=userid,
                            target_dir=prefix,
-                           logger=logger, 
+                           logger=logger,
                            ttl=options.expire)
 
                 info(logger, "Key:{}".format(k))

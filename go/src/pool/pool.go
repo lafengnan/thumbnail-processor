@@ -59,7 +59,7 @@ func (job *Job) Info() {
 }
 
 type Pool struct {
-	muLock                 *sync.Mutex
+	mu                     *sync.Mutex
 	supervisor_started     bool
 	workers_started        bool
 	num_workers            int
@@ -85,7 +85,7 @@ type Pool struct {
 
 func NewPool(workers int) (pool *Pool) {
 	pool = new(Pool)
-	pool.muLock = new(sync.Mutex)
+	pool.mu = new(sync.Mutex)
 	pool.num_workers = workers
 	pool.jobs_ready_to_run = list.New()
 	pool.jobs_succeed = list.New()
@@ -101,9 +101,9 @@ func NewPool(workers int) (pool *Pool) {
 
 func (pool *Pool) AddJob(f func(...interface{}) (interface{}, error), args ...interface{}) {
 	job := NewJob(f, args...)
-	pool.muLock.Lock()
+	pool.mu.Lock()
 	pool.num_jobs_born++
-	pool.muLock.Unlock()
+	pool.mu.Unlock()
 	pool.job_in <- job
 	<-job.added
 }
@@ -176,9 +176,9 @@ func working(job *Job) (err error) {
 // Start a worker
 func (pool *Pool) startWorker(idx int) {
 	log.Printf("Starting worker %d...", idx)
-	pool.muLock.Lock()
+	pool.mu.Lock()
 	pool.num_running_workers++
-	pool.muLock.Unlock()
+	pool.mu.Unlock()
 	job_out := make(chan *Job)
 WORKER_LOOP:
 	for {
