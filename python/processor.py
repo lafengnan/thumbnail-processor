@@ -9,6 +9,8 @@ import redis
 from tiers.tier import RedisStore, timing, TIER_0
 
 from optparse import OptionParser
+import gevent
+from hashlib import md5
 
 Commands = {"upload", "download"}
 
@@ -45,10 +47,12 @@ def get_file_content(fpath):
 
 @timing(logger)
 def upload(client, userid, uuid, content):
+    logger.info("downloading {}".format(userid+":"+uuid))
     client.upload(userid+":"+uuid, data=content)
 
 @timing(logger)
 def download(client, userid, uuid):
+    logger.info("downloading {}".format(userid+":"+uuid))
     fname = userid + ":" + uuid
     return client.download(fname)
 
@@ -56,9 +60,9 @@ def download(client, userid, uuid):
 def flush(client, userid, uuid, output, content):
     with open(output, 'wb') as f:
         f.write(content)
+        f.flush()
     if os.path.exists(output):
         client.queue.release(userid+":"+uuid)
-
 
 def main():
     parser = OptionParser(USAGE)
@@ -99,19 +103,19 @@ def main():
     if options.redis:
         client  = RedisStore(redis_conn, TIER_0, None, logger=logger)
     if cmd == 'upload':
-        content = get_file_content(fpath=options.file)
-        upload(client,
-               userid=options.userid,
-               uuid=options.uuid,
-               content=content)
+        # Trick filename is split by , to simulate multiple upload
+        contents = [get_file_content(fpath=f) for f in options.file.split(',')]
+        gevent.joinall([gevent.spawn(upload, client, options.userid,
+                                     md5(content).hexdigest(), content)
+                        for content in contents])
     elif cmd == 'download':
-        content = download(client,
+        k, content = download(client,
                            userid=options.userid,
                            uuid=options.uuid)
         flush(client,
               userid=options.userid,
-              uuid=options.uuid,
-              output=options.outfile,
+              uuid=k.split(':')[-1],
+              output=k.split(':')[-1],
               content=content)
 
 if __name__ == '__main__':

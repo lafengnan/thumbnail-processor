@@ -76,7 +76,8 @@ class ReliableQueue(object):
         self._size = new_size
 
     def __str__(self):return str(id(self))
-
+    
+    @property
     def queue_is_full(self):
         try:
             return self.redis.llen(self.pending_queue) >= self.size
@@ -94,7 +95,7 @@ class ReliableQueue(object):
 
         """
         try:
-            if self.queue_is_full():
+            if self.queue_is_full:
                 raise EReliableQueueFull(self)
             pipe = self.redis.pipeline(transaction=not self.has_proxy)
             pipe.lpush(self.pending_queue, k).hset(self.data_set, k, data)
@@ -118,12 +119,17 @@ class ReliableQueue(object):
         try:
             k = self.redis.rpoplpush(self.pending_queue, self.working_queue)
             if k:
+                self.logger.info("dequeue {}".format(k))
                 data = self.redis.hget(self.data_set, k)
                 if not data:
                     raise ERedisDataMissing(k)
             else:
+                # First to check working queue, if it is in working queue 
+                # means some error happens to app. Requeue k into pending queue
+                # then retry
+                # TBD
                 raise ERedisKeyNotFound(k)
-            return data
+            return k, data
         except:
             raise
 
@@ -145,9 +151,9 @@ class ReliableQueue(object):
         except:
             raise
 
-    def requeue(self, k, data):
+    def requeue(self, k):
         try:
-            if not self.redis.exists(k) and not self.queue_is_full():
+            if not self.redis.exists(k) and not self.queue_is_full:
                 self.redis.lpush(self.pending_queue, k)
         except:
             raise
@@ -226,7 +232,7 @@ class RedisStore(StoreBase):
                                          next_tier,
                                          *args,
                                          **kwargs)
-        self.queue = ReliableQueue(conn, size=kwargs.get('size', 1024), *args, **kwargs)
+        self.queue = ReliableQueue(conn, *args, **kwargs)
 
     def _upload(self, fname=None, data=None, *args, **kwargs):
         """
@@ -263,8 +269,8 @@ class RedisStore(StoreBase):
         if not fname:
             raise Exception("Invalid key: {k}".format(k=fname))
         try:
-            data = self.queue.dequeue()
-            return data
+            k, data = self.queue.dequeue()
+            return k, data
         except (ERedisDataMissing, ERedisKeyNotFound) as e:
             self.logger.warn(e)
             try:
