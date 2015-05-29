@@ -6,7 +6,7 @@ import os
 import logging
 from logging import StreamHandler, FileHandler
 import redis
-from tiers.tier import RedisStore, timing
+from tiers.tier import RedisStore, timing, TIER_0
 
 from optparse import OptionParser
 
@@ -44,18 +44,20 @@ def get_file_content(fpath):
     return content
 
 @timing(logger)
-def upload(client, userid, uuid, fpath):
-    content = get_file_content(fpath)
+def upload(client, userid, uuid, content):
     client.upload(userid+":"+uuid, data=content)
 
 @timing(logger)
-def download(client, userid, uuid, output):
+def download(client, userid, uuid):
     fname = userid + ":" + uuid
-    content = client.download(fname)
+    return client.download(fname)
+
+@timing(logger)
+def flush(client, userid, uuid, output, content):
     with open(output, 'wb') as f:
         f.write(content)
     if os.path.exists(output):
-        client.queue.release(fname)
+        client.queue.release(userid+":"+uuid)
 
 
 def main():
@@ -95,13 +97,22 @@ def main():
 
     redis_conn = redis.client.StrictRedis(host=REDIS, port=PORT)
     if options.redis:
-        client  = RedisStore(redis_conn, 0, None, logger=logger)
+        client  = RedisStore(redis_conn, TIER_0, None, logger=logger)
     if cmd == 'upload':
-        upload(client, userid=options.userid, uuid=options.uuid, fpath=options.file)
+        content = get_file_content(fpath=options.file)
+        upload(client,
+               userid=options.userid,
+               uuid=options.uuid,
+               content=content)
     elif cmd == 'download':
-        download(client, userid=options.userid, uuid=options.uuid, output=options.outfile)
+        content = download(client,
+                           userid=options.userid,
+                           uuid=options.uuid)
+        flush(client,
+              userid=options.userid,
+              uuid=options.uuid,
+              output=options.outfile,
+              content=content)
 
 if __name__ == '__main__':
     sys.exit(main())
-
-
