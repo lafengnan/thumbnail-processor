@@ -4,9 +4,9 @@ julep.tiers.tier
 
 This module contains the interfaces responsible for storing data into a
 concrete backend storage. Suppose user can choose where to store data, such as
-local file system, a cache system, or an object storage. Currently plan to
-support Redis cache firstly. In the future new storage maybe introduced for
-data staging or persistence.
+local file system, a cache system, or an object storage. Planning to support
+Redis cache firstly. In the future new storage maybe introduced for data
+staging or persistence.
 
 """
 import logging
@@ -35,16 +35,17 @@ def timing(logger):
 
 class ReliableQueue(object):
     """
-    ReliableQueue represents the queues resident in Redis.A ReliableQueue is
+    ReliableQueue represents the queues resident in Redis. A ReliableQueue is
     consist of two separate Redis lists:
         pending_queue [userid:uuid, ...]
         working_queue [userid:uuid, ...]
-    The data access in Redis will look like following format:
-        LPUSH pending_queue userid:uuid
-        RPOPLPUSH pending_queue, working_queue, userid:uuid
 
     And a hash set stores real binary data:
         data_set: {userid:uuid => data, ...}
+
+    The data access in Redis looks like following format:
+        LPUSH pending_queue userid:uuid
+        RPOPLPUSH pending_queue, working_queue, userid:uuid
 
     param redis: the redis connection
     param size: the maximum length of a ReliableQueue, default value 1024
@@ -87,7 +88,7 @@ class ReliableQueue(object):
         enqueue will push data into pending queue.
         This mehtod comprises two subsequent commands:lpush and hset. In order
         to improve performance as much as possible, the requests would be sent
-        via pipelining. While initializing pipe object please make sure set
+        via pipelining. While initializing pipe object please make sure to set
         transaction=False, since Twemproxy does not support Redis transactions
         now.
 
@@ -108,9 +109,9 @@ class ReliableQueue(object):
     def dequeue(self):
         """
         dequeue uses Redis RPOPLPUSH command to pop an element and clone it
-        into working queue atomically. After get the element key, invoking
-        HGET command to retrieve real data from hash set. Compared to enqueue
-        operation pipelining is unfeasible here, since we are not aware of the
+        into working queue atomically. After getting key, HGET command is
+        invokded to retrieve real data from hash set. Compared to enqueue
+        operation, pipelining is unfeasible here, since we are not aware of the
         popped key.
         """
         data = None
@@ -128,14 +129,14 @@ class ReliableQueue(object):
 
     def release(self, k):
         """
-        After data is processed, the original data coulde be cleaned up. Since
+        After data is processed, the original data should cleaned up. Since
         Reliable queue comprises three components:
             pending queue
             working queue
             data set
-        The original data has already been released from pending queue, but
-        the key still reside in working queue and the real data also hide in
-        data set.
+        The original data residented in pending queue has been cleared in
+        dequeue operation, but its clone still resides in working queue and the
+        real data also hide in data set.
         """
         try:
             pipe = self.redis.pipeline(transaction=not self.has_proxy)
@@ -154,11 +155,12 @@ class ReliableQueue(object):
 class StoreBase(object):
     """
     StoreBase repsents the abstract interface base class. The concrete class
-    should inherit from TierBase to implement funcationalities. By now try to
+    should inherit from StoreBase to implement funcationalities. By now try to
     support two tiers, with the third tier reserved for future usage.
-    The first tier should be used for the fastest backend storage in the whole
-    infrastructure, the second one works  as a slower storge to failover,
-    backup, or persistent data for the first tier.
+
+    The first tier should be the fastest backend storage in the whole
+    infrastructure, the subsequent tiers work as the parent tier's backup. such
+    as to failover, backup, or persistent data for its parent tier.
 
     .--------.   failover    .--------.    failover    .--------.
     | tier 0 | ------------> | tier 1 | -------------> | tier 2 |
@@ -201,10 +203,9 @@ class StoreBase(object):
 class RedisStore(StoreBase):
     """
     RedisStore will handle all data transactions to/from Redis. Generally
-    Redis is always faster than other backend. Consequently prefer to use Redis
-    as the first tier to store data. In order to store and process data safely,
-    reliable queues will be used. Reliabe queues are consist of two seperate
-    queues:
+    Redis is always faster than other backends. So we prefer to use Redis as
+    the first tier. In order to store and process data safely, reliable queues
+    will be used. Reliabe queues are consist of two seperate lists:
         pending_queue
         working_queue
     the pending queue is used for storing data transient. While consumer starts
@@ -231,10 +232,10 @@ class RedisStore(StoreBase):
         """
         In Redis the fname should be a key, while in polaris infrastructure
         userid and uuid are the only two uniques. Consequently the fname
-        should be composed by userid and uuid to identify the unique key.
+        should be composed by userid and uuid to identify an unique key.
         By now try to set fname = userid:uuid
 
-        uploading is acchieved by using reliable queue's enqueue operation.
+        uploading is achieved by using reliable queue's enqueue operation.
 
         """
         if not fname:
@@ -251,14 +252,13 @@ class RedisStore(StoreBase):
 
     def _download(self, fname=None, *args, **kwargs):
         """
-        In Redis fname should be a key. In Polaris infrastructure userid and
-        uuid are the only two unique identifiers. So please make sure the fname
-        format is "userid:uuid".
+        So please make sure the fname format is "userid:uuid".
 
-        download is completed via reliable queue's dequeue operation:
+        downloading is completed via reliable queue's dequeue operation:
             1. RPOPLPUSH pending_queue, working_queue, k
             2. HGET working_queue, k
-            3. After processing completed, invoking release queue operation
+            3. After processing completed, release queue operation should be
+            invoked to clean up data.
         """
         if not fname:
             raise Exception("Invalid key: {k}".format(k=fname))
@@ -277,9 +277,9 @@ class RedisStore(StoreBase):
 
     def _failover(self, fname, data=None, callback=None, *args, **kwargs):
         """
-        failover tries to access the next tier to upload/dowanload the
-        requested content. Since the fname in polaris infrastructure is set by
-        userid:uuid, user should handle the fname => userid, uuid mapping.
+        failover tries to access the next tier to upload/dowanload requested
+        content. Since the fname in polaris infrastructure is set by
+        userid:uuid, user should handle the mapping of fname => userid:uuid.
 
         """
         try:
@@ -290,8 +290,8 @@ class RedisStore(StoreBase):
 class SwiftStore(StoreBase):
     """
     SwiftStore handles all data transactions to/from Swift. Ideally Swift
-    only act as the 2rd tier to failover for Redis and store the files that
-    need pesistence forever.
+    only act as the 2nd tier to failover, or backup for Redis and store the
+    files that need pesistence forever.
 
     :param swift_conn: See :attr `swift_conn`
 
