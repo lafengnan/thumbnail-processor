@@ -6,7 +6,7 @@ import os
 import logging
 from logging import StreamHandler, FileHandler
 import redis
-from tiers.tier import RedisStore, timing, TIER_0
+from tiers.tier import RedisStore, ReliableQueue, ReliableNamingQueue, HashQueue, timing, TIER_0
 
 from optparse import OptionParser
 import gevent
@@ -47,7 +47,7 @@ def get_file_content(fpath):
 
 @timing(logger)
 def upload(client, userid, uuid, content):
-    logger.info("downloading {}".format(userid+":"+uuid))
+    logger.info("uploading {}".format(userid+":"+uuid))
     client.upload(userid+":"+uuid, data=content)
 
 @timing(logger)
@@ -101,7 +101,7 @@ def main():
 
     redis_conn = redis.client.StrictRedis(host=REDIS, port=PORT)
     if options.redis:
-        client  = RedisStore(redis_conn, TIER_0, None, logger=logger)
+        client  = RedisStore(redis_conn, TIER_0, None, logger=logger, queue_class=ReliableQueue)
     if cmd == 'upload':
         # Trick filename is split by , to simulate multiple upload
         contents = [get_file_content(fpath=f) for f in options.file.split(',')]

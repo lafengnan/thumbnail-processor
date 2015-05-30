@@ -33,7 +33,127 @@ def timing(logger):
         return wrapper
     return deco
 
-class ReliableQueue(object):
+class QueueBase(object):
+    redis = None
+
+    def __init__(self, redis, size=1024, logger=None, has_proxy=False):
+        self.redis = redis
+        self._size = size
+        self.logger = logger
+        self.has_proxy = has_proxy
+
+    @property
+    def size(self):
+        return self._size
+
+    @size.setter
+    def size(self, new_size):
+        self._size = new_size
+
+    def __str__(self): return self.__class__.__name__
+
+    def enqueue(self, k, data):
+        raise NotImplemented
+
+    def dequeue(self):
+        raise NotImplemented
+
+    def release(self):
+        raise NotImplemented
+
+class HashQueue(QueueBase):
+    def __init__(self, redis, size=1024, logger=None, has_proxy=False, **kwargs):
+        super(HashQueue, self).__init__(redis, size, logger, has_proxy)
+        self.data_set = kwargs.get('data_set', 'thumbnails_hash')
+
+    def __len__(self):
+        try:
+            return self.redis.hlen(self.data_set)
+        except:
+            raise
+
+    @property
+    def queue_is_full(self):
+        return len(self) == self.size
+
+    def enqueue(self, k, data):
+        try:
+            ok = self.redis.hset(self.data_set, k, data)
+            if not ok:
+                self.logger.info("key {} was existing, reset to new value again!")
+        except:
+            raise
+
+    def dequeue(self, k):
+        try:
+            ok = self.redis.hget(self.data_set, k)
+            if not ok:
+                self.logger.info("Key {} was not found!")
+        except:
+            raise
+
+    def release(self, k):
+        try:
+            ok = self.redis.hdel(self.data_set, k)
+            if ok == 0:
+                self.logger.debug("key {} to delete was not found!")
+        except:
+            raise
+
+class ReliableNamingQueue(QueueBase):
+
+    def __init__(self, redis, size=1024, logger=None, has_proxy=False, **kwargs):
+        super(ReliableNamingQueue, self).__init__(redis, size, logger, has_proxy)
+        self.userid = kwargs.get('userid')
+        self.pending_queue = "pending_{}".format(self.userid) if self.userid \
+        else None
+        self.working_queue = "working_{}".format(self.userid) if self.userid \
+        else None
+        self.data_set = kwargs.get('data_set', 'thumbnail')
+
+    @property
+    def queue_is_full(self):
+        try:
+            return self.size == self.redis.llen(self.pending_queue)
+        except:
+            raise
+
+    def enqueue(self, k, data):
+        if not self.queue_is_full:
+            try:
+                pipe = self.redis.pipeline(transaction=not self.has_proxy)
+                pipe.lpush(self.pending_queue, k).hset(self.data_set, k, data)
+                l, ok = pipe.execute()
+                if not ok:
+                    self.logger.info("Key {} has already existed in queue!")
+            except:
+                raise
+        else:
+            raise EReliableQueueFull(self)
+
+    def dequeue(self):
+        try:
+            k = self.redis.rpoplpush(self.pending_queue, self.working_queue)
+            if k:
+                data = self.redis.hget(self.data_set, k)
+                if not data:
+                    raise ERedisDataMissing(k)
+                return k, data
+            else:
+                self.logger.debug("pending queue is empty,\
+                                  checking working queue!")
+                wqlen = self.redis.llen(self.working_queue)
+                if wqlen > 0:
+                    self.logger.debug("Error must happened in last execution!\
+                                      clone all items into pending queue!")
+                    for _ in xrange(wqlen + 1):
+                        self.redis.rpoplpush(self.working_queue,
+                                             self.pending_queue)
+                    self.dequeue()
+        except:
+            raise
+
+class ReliableQueue(QueueBase):
     """
     ReliableQueue represents the queues resident in Redis. A ReliableQueue is
     consist of two separate Redis lists:
@@ -55,28 +175,12 @@ class ReliableQueue(object):
     param data_set: the internal redis hash table name which stores real data
 
     """
-    redis = None
-
-    def __init__(self, redis, size=1024, has_proxy=False, *args, **kwargs):
-        self._size = size
-        self._len = 0
-        self.redis = redis
-        self.has_proxy = has_proxy
+    def __init__(self, redis, size=1024, logger=None, has_proxy=False, **kwargs):
+        super(ReliableQueue, self).__init__(redis, size, logger, has_proxy)
         self.pending_queue = kwargs.get("pending_queue", "pending")
         self.working_queue = kwargs.get("working_queue", "working")
         self.data_set = kwargs.get("data_set", "thumbnail")
-        self.logger = kwargs.get("logger")
 
-    @property
-    def size(self):
-        return self._size
-
-    @size.setter
-    def size(self, new_size):
-        self._size = new_size
-
-    def __str__(self):return str(id(self))
-    
     @property
     def queue_is_full(self):
         try:
@@ -124,11 +228,18 @@ class ReliableQueue(object):
                 if not data:
                     raise ERedisDataMissing(k)
             else:
-                # First to check working queue, if it is in working queue 
-                # means some error happens to app. Requeue k into pending queue
-                # then retry
-                # TBD
-                raise ERedisKeyNotFound(k)
+                self.logger.debug("pending queue is empty,\
+                                  checking working queue!")
+                wqlen = self.redis.llen(self.working_queue)
+                if wqlen > 0:
+                    self.logger.debug("Error must happened in last execution!\
+                                      clone all items into pending queue!")
+                    for _ in xrange(wqlen + 1):
+                        self.redis.rpoplpush(self.working_queue,
+                                             self.pending_queue)
+                    return self.dequeue()
+                else:
+                    self.logger.debug("Queue is clean!")
             return k, data
         except:
             raise
@@ -185,13 +296,11 @@ class StoreBase(object):
     #: next_tier represents the backup tier
     next_tier = None
 
-    def __init__(self, conn, rank, next_tier, *args, **kwargs):
+    def __init__(self, conn, rank, next_tier, logger=None):
         self.conn = conn
         self.rank = rank
         self.next_tier = next_tier
-        self.logger = kwargs.get('logger')
-        self.args = args
-        self.kwargs = kwargs
+        self.logger = logger
 
     def __str__(self): return self.__class__.__name__
 
@@ -224,15 +333,12 @@ class RedisStore(StoreBase):
     :param redis_conn: See :attr `redis_conn`
 
     """
-    queue = None
+    queue_cls = None
 
-    def __init__(self, conn, rank, next_tier, *args, **kwargs):
-        super(RedisStore, self).__init__(conn,
-                                         rank,
-                                         next_tier,
-                                         *args,
-                                         **kwargs)
-        self.queue = ReliableQueue(conn, *args, **kwargs)
+    def __init__(self, conn, rank, next_tier, logger=None, **kwargs):
+        super(RedisStore, self).__init__(conn, rank, next_tier, logger)
+        self.queue_cls = kwargs.get('queue_class', ReliableQueue)
+        self.queue = self.queue_cls(conn, **kwargs)
 
     def _upload(self, fname=None, data=None, *args, **kwargs):
         """
