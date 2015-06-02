@@ -6,7 +6,8 @@ import os
 import logging
 from logging import StreamHandler, FileHandler
 import redis
-from tiers.tier import RedisStore, ReliableQueue, ReliableNamingQueue, HashQueue, timing, TIER_0
+from tiers.tier import RedisStore, SwiftStore, timing, TIER_0
+from tiers.queue import HashQueue
 
 from optparse import OptionParser
 import gevent
@@ -62,7 +63,7 @@ def flush(client, userid, uuid, output, content):
         f.write(content)
         f.flush()
     if os.path.exists(output):
-        client.queue.release(userid+":"+uuid)
+        client.delete(userid+":"+uuid)
 
 def main():
     parser = OptionParser(USAGE)
@@ -101,7 +102,12 @@ def main():
 
     redis_conn = redis.client.StrictRedis(host=REDIS, port=PORT)
     if options.redis:
-        client  = RedisStore(redis_conn, TIER_0, None, logger=logger, queue_class=ReliableQueue)
+        client  = RedisStore(redis_conn, TIER_0, SwiftStore, HashQueue, logger,
+                             size=1024,
+                             values='thumbnail',
+                             stats='stats',
+                             has_proxy=False,
+                             retries=3)
     if cmd == 'upload':
         # Trick filename is split by , to simulate multiple upload
         contents = [get_file_content(fpath=f) for f in options.file.split(',')]
@@ -109,13 +115,11 @@ def main():
                                      md5(content).hexdigest(), content)
                         for content in contents])
     elif cmd == 'download':
-        k, content = download(client,
-                           userid=options.userid,
-                           uuid=options.uuid)
+        k, content = download(client, userid=options.userid, uuid=options.uuid)
         flush(client,
               userid=options.userid,
-              uuid=k.split(':')[-1],
-              output=k.split(':')[-1],
+              uuid=options.uuid,
+              output=options.outfile,
               content=content)
 
 if __name__ == '__main__':

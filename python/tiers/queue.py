@@ -11,11 +11,35 @@ is used to protect data.
 import time
 import pickle
 from .exceptions import ERedisDataMissing, ERedisKeyNotFound, \
-    EReliableQueueFull
+    ERedisQueueFull
 
 JOB_ENQUEUED = 1
 JOB_DEQUEUED = 2
 JOB_UNKNOWN_STATE = 3
+
+class Job(object):
+    """
+    Job represents a task that identify an file operation.
+    param key: the key in redis
+    param timeout: If the job state not change for timeout seconds,
+                   it will be revoked. 0 means never timeout.
+    """
+    def __init__(self, key, timeout=0):
+        self.key = key
+        self.state = 0
+        self.enqueue_ts = None
+        self.dequeue_ts = None
+        self.timeout = timeout
+
+    def change_state(self, new_state):
+        self.state = new_state
+        now = time.time()
+        if self.state == JOB_ENQUEUED:
+            self.enqueue_ts  = now
+        elif self.state == JOB_DEQUEUED:
+            self.dequeue_ts = now
+        else:
+            pass
 
 class QueueBase(object):
     """
@@ -31,56 +55,6 @@ class QueueBase(object):
 
     """
     redis = None
-
-    class JobStat(object):
-        """
-        Stat will be used to monitoring the job stats.
-        """
-
-        def __int__(self, key):
-            self._key = key
-            self._state = 0
-            self._enqueue_time = None
-            self._dequeue_time = None
-
-        @property
-        def key(self):
-            return self._key
-
-        @property
-        def state(self):
-            return self._state
-
-        @state.setter
-        def state(self, new_state):
-            self._state = new_state
-
-        def change_state(self,
-                         new_state,
-                         enqueue_ts=None,
-                         dequeue_ts=None,
-                         ):
-            self.state = new_state
-            if enqueue_ts:
-                self.enqueue_time = enqueue_ts
-            if dequeue_ts:
-                self.dequeue_time = dequeue_ts
-
-        @property
-        def enqueue_time(self):
-            return self._enqueue_time
-
-        @enqueue_time.setter
-        def enqueue_time(self, ts):
-            self._enqueue_time = ts
-
-        @property
-        def dequeue_time(self):
-            return self._dequeue_time
-
-        @_dequeue_time.setter
-        def last_dequeue_time(self, ts):
-            self._dequeue_time = ts
 
     def __init__(self, conn, size, values, stats, has_proxy,
                  logger=None, retries=3):
@@ -131,61 +105,47 @@ class HashQueue(QueueBase):
     """
     def enqueue(self, k, data):
         try:
-            job_stat = self.JobStat(k)
-            job_stat.change_state(JOB_ENQUEUED, enqueue_ts=time.time())
-            job_stat = pickle.dumps(job_stat)
+            if not self.queue_is_full:
+                job = Job(k)
+                job.change_state(JOB_ENQUEUED)
+                job = pickle.dumps(job)
 
-            pipe = self.redis.pipeline(transaction=not self.hash_proxy)
-            pipe.hset(self.values, k, data).hset(self.stats, k, job_stat)
-            ok, _ = pipe.execute()
-            if not ok:
-                # The k has already been set in hash set
-                if self.logger:
-                    self.logger.debug("{} was rewritten by new data".format(k))
+                pipe = self.redis.pipeline(transaction=not self.has_proxy)
+                pipe.hset(self.values, k, data).hset(self.stats, k, job)
+                ok, job = pipe.execute()
+                if not ok or not job:
+                    # The k has already been set in hash set
+                    if self.logger:
+                        self.logger.debug("{} was rewritten by new data".format(k))
+            else:
+                raise ERedisQueueFull(self)
         except:
             raise
 
     def dequeue(self, k):
         try:
-            data = self.redis.hget(self.values, k)
+            pipe = self.redis.pipeline(transaction=not self.has_proxy)
+            pipe.hget(self.values, k).hget(self.stats, k)
+            data, job = pipe.execute()
             if not data:
-                # 1. k was not existing
-                # 2. data missing
-                job_stat = self.redis.hget(self.stats, k)
-                if not job_stat:
-                    # Oops! k and its data were dropped into blackhole.
-                    # either been processed or missing.
+                # case 1. data has been removed
+                # case 2. data missing happened
+                if not job:
                     raise ERedisKeyNotFound(k)
                 else:
-                    if pickle.loads(job_stat).state == JOB_DEQUEUED:
-                        # job has not been dequeued but never released
-                        # seems data missing happened.
-                        raise ERedisDataMissing(k)
-                    else:
-                        # job has been processed, cleaning the orphan stats
-                        self.redis.hdel(self.stats, k)
-                        raise ERedisKeyNotFound(k)
-            job_stat = self.redis.hget(self.stats, k)
-            if not job_stat:
-                # stats missing, rebuilding one new stat
-                job_stat = self.JobStat(k)
-                job_stat.change_state(JOB_DEQUEUED, dequeue_ts=time.time())
-            else:
-                job_stat = pickle.loads(job_stat)
-                job_stat.change_state(JOB_DEQUEUED, dequeue_ts=time.time())
-            job_stat = pickle.dumps(job_stat)
-            self.redis.hset(self.stats, k, job_stat)
-            return data
+                    raise ERedisDataMissing(k)
+            job = pickle.loads(job)
+            job.state = JOB_DEQUEUED
+            self.redis.hset(self.stats, k, pickle.dumps(job))
+            return k, data
         except:
             raise
 
     def release(self, k):
         try:
-            pipe = self.redis.pipeline(transaction=not self.has_prox)
+            pipe = self.redis.pipeline(transaction=not self.has_proxy)
             pipe.hdel(self.values, k).hdel(self.stats, k)
-            ok, _ = pipe.execute()
-            if not ok and self.logger:
-                self.logger.debug("release a nonexisting key:{}".format(k))
+            data_ok, job_ok = pipe.execute()
         except:
             raise
 
@@ -249,7 +209,7 @@ class ReliableQueue(QueueBase):
         """
         try:
             if self.queue_is_full:
-                raise EReliableQueueFull(self)
+                raise ERedisQueueFull(self)
             job_stat = self.JobStat(k)
             job_stat.state = 'enqueued'
             job_stat.enqueue_time = time.time()

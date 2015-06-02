@@ -26,9 +26,9 @@ class ERedisKeyNotFound(Exception):
         self.key = key
 
     def __str__(self):
-        return "Redis Warning: Key: {} is not found".format(self.key)
+        return "Redis Warning: {} was not found".format(self.key)
 
-class EReliableQueueFull(Exception):
+class ERedisQueueFull(Exception):
     """
     A reliable queue is full
     """
@@ -36,7 +36,7 @@ class EReliableQueueFull(Exception):
         self.q = q
 
     def __str__(self):
-        return "Redis Error: Reliabe queue {} is full!".format(self.q)
+        return "Redis Error: Queue {} is full!".format(self.q)
 
 class ERedisKeyError(Exception):
     """
